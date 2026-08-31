@@ -1,0 +1,28 @@
+# Contact info required by SEC's fair access policy (real name + email).
+# SEC will throttle or block requests without a descriptive User-Agent.
+# https://www.sec.gov/os/webmaster-faq#developers
+user_agent: "Yash yashmaheshbangera.work@gmail.com - RAG portfolio project"
+
+# Where downloaded filings + metadata sidecars are written
+output_dir: "data/raw"
+
+# Only pull filings from this year onward
+since_year: 2022
+
+# Financial statement filings (add "8-K" if you also want earnings announcements)
+form_types:
+  - "10-K"
+  - "10-Q"
+
+# Deliberately spans sectors so retrieval/eval isn't just "one tech company's RAG"
+tickers:
+  - AAPL   # Technology
+  - MSFT   # Technology
+  - JPM    # Financials
+  - GS     # Financials
+  - JNJ    # Healthcare
+  - PFE    # Healthcare
+  - XOM    # Energy
+  - WMT    # Consumer staples
+  - KO     # Consumer staples
+  - TSLA   # Automotive / industrials
