@@ -32,7 +32,7 @@ ARCHIVE_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{accession_nodash}/
 REQUEST_DELAY_SECONDS = 0.15  # stays comfortably under SEC's 10 req/sec limit
 
 
-def load_config(path: str = "config.yaml") -> dict:
+def load_config(path: str = "data/config.yaml") -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
 
@@ -53,11 +53,18 @@ def build_session(user_agent: str) -> requests.Session:
 
 
 def get_ticker_to_cik(session: requests.Session) -> dict:
-    """Returns {ticker: cik_int} using SEC's official ticker -> CIK mapping."""
+    """Returns {ticker: {"cik": int, "name": str}} using SEC's official
+    ticker -> CIK mapping. The mapping also includes a "title" field (the
+    company's registered name) that's free in the same response -- captured
+    here rather than discarded, so downstream chunks can carry a
+    human-readable company name alongside the ticker."""
     resp = session.get(TICKERS_URL, timeout=30)
     resp.raise_for_status()
     data = resp.json()
-    return {v["ticker"].upper(): v["cik_str"] for v in data.values()}
+    return {
+        v["ticker"].upper(): {"cik": v["cik_str"], "name": v["title"]}
+        for v in data.values()
+    }
 
 
 def get_filings_for_cik(session: requests.Session, cik: int) -> dict:
@@ -114,12 +121,14 @@ def main():
 
     for ticker in config["tickers"]:
         ticker = ticker.upper()
-        cik = ticker_to_cik.get(ticker)
-        if cik is None:
+        entry = ticker_to_cik.get(ticker)
+        if entry is None:
             print(f"  [skip] {ticker}: not found in SEC ticker list")
             continue
+        cik = entry["cik"]
+        company_name = entry["name"]
 
-        print(f"Fetching filings for {ticker} (CIK {cik})...")
+        print(f"Fetching filings for {ticker} ({company_name}, CIK {cik})...")
         submissions = get_filings_for_cik(session, cik)
         time.sleep(REQUEST_DELAY_SECONDS)
 
@@ -134,6 +143,7 @@ def main():
 
                 meta = {
                     "ticker": ticker,
+                    "company_name": company_name,
                     "cik": cik,
                     "form_type": filing["form"],
                     "fiscal_period_end": filing["report_date"],

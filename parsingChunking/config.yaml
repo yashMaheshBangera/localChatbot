@@ -1,0 +1,68 @@
+# Contact info required by SEC's fair access policy (real name + email).
+# SEC will throttle or block requests without a descriptive User-Agent.
+# https://www.sec.gov/os/webmaster-faq#developers
+user_agent: "Yash <your_email@example.com> - RAG portfolio project"
+
+# Where downloaded filings + metadata sidecars are written
+output_dir: "data/raw"
+
+# Only pull filings from this year onward
+since_year: 2022
+
+# Financial statement filings (add "8-K" if you also want earnings announcements)
+form_types:
+  - "10-K"
+  - "10-Q"
+
+# Deliberately spans sectors so retrieval/eval isn't just "one tech company's RAG"
+tickers:
+  - AAPL   # Technology
+  - MSFT   # Technology
+  - JPM    # Financials
+  - GS     # Financials
+  - JNJ    # Healthcare
+  - PFE    # Healthcare
+  - XOM    # Energy
+  - WMT    # Consumer staples
+  - KO     # Consumer staples
+  - TSLA   # Automotive / industrials
+
+# --- Parsing / chunking stage ---
+
+# Where parsed + chunked output (JSONL) is written
+processed_dir: "data/processed"
+
+# Tokenizer to size chunks against. Should match (or closely approximate)
+# whatever embedding model you plan to use downstream, since that's what
+# actually consumes the token budget.
+#
+# bge-large-en-v1.5 chosen over bge-base for one specific reason: it's a
+# first-class citizen in BOTH Ollama's model library and vLLM's pooling
+# support with zero special flags or prompt-prefix conventions (unlike e.g.
+# nomic-embed-text, which needs --trust-remote-code in vLLM plus a
+# search_query:/search_document: prefix on every input). That keeps the
+# model choice decoupled from which serving layer you end up picking.
+# No open-source finance-tuned alternative currently has strong enough
+# validation to prefer over this (see project discussion).
+embedding_model_id: "BAAI/bge-large-en-v1.5"
+
+# Target chunk size in tokens. 400-600 is a reasonable range for financial
+# prose; tables are kept atomic regardless of this budget.
+max_tokens: 512
+
+# --- Embedding stage ---
+
+# Where embedded chunks (chunk record + "embedding" vector) are written
+embedded_dir: "data/embedded"
+
+# vLLM server URL. Start it first, in a separate terminal:
+#   vllm serve BAAI/bge-large-en-v1.5 --task embed
+vllm_base_url: "http://localhost:8000"
+
+# Only needed if you started vLLM with --api-key; leave null otherwise
+vllm_api_key: null
+
+# How many chunks to send per HTTP request. Higher = fewer round trips but
+# larger payloads; 32 is a reasonable starting point to tune against your
+# hardware.
+embedding_batch_size: 32
