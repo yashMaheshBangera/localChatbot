@@ -4,13 +4,12 @@
 user_agent: "Yash <your_email@example.com> - RAG portfolio project"
 
 # Where downloaded filings + metadata sidecars are written.
-# Resolved relative to THIS FILE's own location (the project root), not
-# relative to whichever script reads it or where you run python from --
-# see find_config()/resolve_dir() in each script. This project's layout has
-# one config.yaml at the root, with each pipeline stage in its own
-# subdirectory (data/, parsingChunking/, embed/, ...) that finds this file
-# by searching upward from itself.
-output_dir: "data/raw"
+# NOTE: relative paths here are resolved against whatever directory you run
+# the scripts FROM, not against this file's location. This project's layout
+# has data/ as a sibling of the scripts (parsingChunking/../data), so paths
+# use "../" -- assumes you always run scripts with parsingChunking/ as your
+# working directory (cd into it first), consistent throughout this project.
+output_dir: "../data/raw"
 
 # Only pull filings from this year onward
 since_year: 2022
@@ -36,7 +35,7 @@ tickers:
 # --- Parsing / chunking stage ---
 
 # Where parsed + chunked output (JSONL) is written
-processed_dir: "data/processed"
+processed_dir: "../data/processed"
 
 # Tokenizer to size chunks against. Should match (or closely approximate)
 # whatever embedding model you plan to use downstream, since that's what
@@ -59,7 +58,7 @@ max_tokens: 512
 # --- Embedding stage ---
 
 # Where embedded chunks (chunk record + "embedding" vector) are written
-embedded_dir: "data/embedded"
+embedded_dir: "../data/embedded"
 
 # vLLM server URL. Start it first, in a separate terminal:
 #   vllm serve BAAI/bge-large-en-v1.5 --runner pooling

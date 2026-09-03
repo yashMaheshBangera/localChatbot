@@ -3,6 +3,55 @@
 Builds the raw document corpus for the financial RAG portfolio project by
 pulling 10-K / 10-Q filings directly from SEC EDGAR.
 
+## Project structure
+
+One task per directory, one shared config:
+
+```
+localChatbot/
+  config.yaml           <- single shared config for the whole pipeline
+  requirements.txt      <- single shared dependency list for the whole pipeline
+  README.md             <- this file
+  data/
+    build_dataset.py
+    raw/                <- created by build_dataset.py
+    processed/          <- created by parse_and_chunk.py
+    embedded/           <- created by embed_chunks.py
+  parsingChunking/
+    parse_and_chunk.py
+    dom_walker.py
+    table_cleaner.py
+    check_token_limits.py
+  embedding/
+    embed_chunks.py
+```
+
+`requirements.txt` belongs at the root for the same reason `config.yaml`
+does: it's a single shared dependency list covering every stage (BS4/lxml
+for parsing, LangChain for chunking, requests/transformers for embedding),
+not owned by any one subdirectory -- move it there alongside `config.yaml`
+if you haven't already.
+
+Every script finds `config.yaml` by searching upward from its own location
+until it finds one (`find_config()` in each script) -- it doesn't matter
+that `build_dataset.py` lives in `data/`, `parse_and_chunk.py` lives in
+`parsingChunking/`, and `embed_chunks.py` lives in `embedding/`, since they all
+walk up to the same project root either way. Data-directory paths inside
+`config.yaml` (`output_dir`, `processed_dir`, `embedded_dir`) are then
+resolved relative to wherever that config file actually lives, not
+relative to any individual script or your terminal's current directory --
+so every script agrees on where `data/raw`, `data/processed`, and
+`data/embedded` are, regardless of which one of them you run or from
+where. Verified by simulating this exact directory layout and running each
+script from its actual location before this was written up.
+
+Commands below assume running from the project root (`localChatbot/`),
+matching where this README and `config.yaml` live -- but since path
+resolution searches upward rather than depending on your current
+directory, `cd parsingChunking && python parse_and_chunk.py` works exactly
+as well as `python parsingChunking/parse_and_chunk.py` from the root.
+Whichever's more convenient in the moment.
+
 ## Why SEC EDGAR
 
 - Free, public, no auth, no scraping gray area — safe to publish alongside
@@ -54,7 +103,7 @@ SEC EDGAR requires a descriptive `User-Agent` with real contact info and
 will block generic ones.
 
 ```bash
-python build_dataset.py
+python data/build_dataset.py
 ```
 
 Expect it to take a few minutes given the rate-limit delay (0.15s between
@@ -81,6 +130,7 @@ Each `.meta.json` sidecar looks like:
 ```json
 {
   "ticker": "AAPL",
+  "company_name": "Apple Inc.",
   "cik": 320193,
   "form_type": "10-K",
   "fiscal_period_end": "2023-09-30",
@@ -92,6 +142,17 @@ Each `.meta.json` sidecar looks like:
 }
 ```
 
+`company_name` comes from the `title` field in SEC's own ticker->CIK
+mapping (`company_tickers.json`) -- free in the exact same API response
+already being fetched for the CIK lookup, just not captured in an earlier
+version of this script. It matters downstream for two reasons: a query
+router/entity-extraction step can match on how people actually refer to a
+company in conversation ("Apple") without first needing to resolve that to
+a ticker symbol, and citations/retrieved-source display read better as
+"Apple Inc." than "AAPL". `ticker` remains the field to use for exact
+payload filtering in Qdrant (unambiguous, no casing/formatting variance);
+`company_name` is for the natural-language-facing side of the pipeline.
+
 This metadata schema is what gets carried through to chunk-level metadata
 in the ingestion pipeline (ticker / doc_type / fiscal_period filters at
 retrieval time).
@@ -101,7 +162,7 @@ retrieval time).
 Once `data/raw/` is populated, run:
 
 ```bash
-python parse_and_chunk.py
+python parsingChunking/parse_and_chunk.py
 ```
 
 This is a hand-built parser (`dom_walker.py` + `table_cleaner.py`), not a
@@ -219,6 +280,7 @@ Each line in a `.chunks.jsonl` file is one chunk record:
 {
   "chunk_id": "chunk_435f1053beb0da90",
   "ticker": "AAPL",
+  "company_name": "Apple Inc.",
   "cik": 320193,
   "form_type": "10-Q",
   "fiscal_period_end": "2021-12-25",
@@ -244,7 +306,7 @@ vllm serve BAAI/bge-large-en-v1.5 --task embed
 Then run:
 
 ```bash
-python embed_chunks.py
+python embedding/embed_chunks.py
 ```
 
 This calls vLLM's OpenAI-compatible `/v1/embeddings` endpoint directly over

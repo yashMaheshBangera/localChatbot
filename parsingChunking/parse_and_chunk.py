@@ -53,10 +53,42 @@ from transformers import AutoTokenizer
 
 from dom_walker import build_records
 
+# This script's own directory -- the starting point for finding config.yaml.
+SCRIPT_DIR = Path(__file__).resolve().parent
 
-def load_config(path: str = "parsingChunking/config.yaml") -> dict:
-    with open(path) as f:
-        return yaml.safe_load(f)
+
+def find_config(start: Path, filename: str = "config.yaml", max_levels: int = 6) -> Path:
+    """Searches upward from `start` through parent directories for the
+    shared project config. Scripts live in different task-specific
+    subdirectories (data/, parsingChunking/, embed/, ...) while config.yaml
+    lives once at the shared project root."""
+    current = start
+    for _ in range(max_levels):
+        candidate = current / filename
+        if candidate.exists():
+            return candidate
+        if current.parent == current:
+            break
+        current = current.parent
+    raise FileNotFoundError(
+        f"Could not find {filename} searching upward from {start} "
+        f"(checked {max_levels} levels). Make sure config.yaml exists at "
+        f"your project root."
+    )
+
+
+def load_config() -> tuple:
+    """Returns (config_dict, project_root)."""
+    config_path = find_config(SCRIPT_DIR)
+    with open(config_path) as f:
+        config = yaml.safe_load(f)
+    return config, config_path.parent
+
+
+def resolve_dir(project_root: Path, config: dict, key: str, default: str) -> Path:
+    """Resolves a data-directory config value relative to the project root
+    (where config.yaml lives), not relative to any individual script."""
+    return (project_root / config.get(key, default)).resolve()
 
 
 def build_tokenizer_and_splitter(embedding_model_id: str, max_tokens: int):
@@ -158,9 +190,9 @@ def process_filing(tokenizer, splitter, meta: dict, max_tokens: int) -> list:
 
 
 def main():
-    config = load_config()
-    raw_dir = Path(config.get("output_dir", "data/raw"))
-    processed_dir = Path(config.get("processed_dir", "data/processed"))
+    config, project_root = load_config()
+    raw_dir = resolve_dir(project_root, config, "output_dir", "data/raw")
+    processed_dir = resolve_dir(project_root, config, "processed_dir", "data/processed")
     processed_dir.mkdir(parents=True, exist_ok=True)
 
     manifest_path = raw_dir / "manifest.json"

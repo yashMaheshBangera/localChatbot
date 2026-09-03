@@ -31,10 +31,45 @@ ARCHIVE_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{accession_nodash}/
 
 REQUEST_DELAY_SECONDS = 0.15  # stays comfortably under SEC's 10 req/sec limit
 
+# This script's own directory -- the starting point for finding config.yaml.
+SCRIPT_DIR = Path(__file__).resolve().parent
 
-def load_config(path: str = "data/config.yaml") -> dict:
-    with open(path) as f:
-        return yaml.safe_load(f)
+
+def find_config(start: Path, filename: str = "config.yaml", max_levels: int = 6) -> Path:
+    """Searches upward from `start` through parent directories for the
+    shared project config. Scripts live in different task-specific
+    subdirectories (data/, parsingChunking/, embed/, ...) while config.yaml
+    lives once at the shared project root -- this lets every script find it
+    without needing to know how deep it's nested."""
+    current = start
+    for _ in range(max_levels):
+        candidate = current / filename
+        if candidate.exists():
+            return candidate
+        if current.parent == current:  # reached filesystem root
+            break
+        current = current.parent
+    raise FileNotFoundError(
+        f"Could not find {filename} searching upward from {start} "
+        f"(checked {max_levels} levels). Make sure config.yaml exists at "
+        f"your project root."
+    )
+
+
+def load_config() -> tuple:
+    """Returns (config_dict, project_root) -- project_root is the directory
+    config.yaml was actually found in, used to resolve data-directory paths
+    relative to it rather than relative to any individual script."""
+    config_path = find_config(SCRIPT_DIR)
+    with open(config_path) as f:
+        config = yaml.safe_load(f)
+    return config, config_path.parent
+
+
+def resolve_dir(project_root: Path, config: dict, key: str, default: str) -> Path:
+    """Resolves a data-directory config value relative to the project root
+    (where config.yaml lives), not relative to any individual script."""
+    return (project_root / config.get(key, default)).resolve()
 
 
 def build_session(user_agent: str) -> requests.Session:
@@ -109,14 +144,14 @@ def download_filing(session: requests.Session, cik: int, filing: dict, dest_dir:
 
 
 def main():
-    config = load_config()
+    config, project_root = load_config()
     session = build_session(config["user_agent"])
 
     print("Fetching SEC ticker -> CIK mapping...")
     ticker_to_cik = get_ticker_to_cik(session)
     time.sleep(REQUEST_DELAY_SECONDS)
 
-    raw_dir = Path(config.get("output_dir", "data/raw"))
+    raw_dir = resolve_dir(project_root, config, "output_dir", "data/raw")
     manifest = []
 
     for ticker in config["tickers"]:
