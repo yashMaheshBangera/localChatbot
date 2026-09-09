@@ -27,6 +27,7 @@ import yaml
 
 TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik:010d}.json"
+SUBMISSIONS_PAGE_URL = "https://data.sec.gov/submissions/{name}"
 ARCHIVE_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{accession_nodash}/{filename}"
 
 REQUEST_DELAY_SECONDS = 0.15  # stays comfortably under SEC's 10 req/sec limit
@@ -108,30 +109,71 @@ def get_filings_for_cik(session: requests.Session, cik: int) -> dict:
     return resp.json()
 
 
-def filter_filings(submissions: dict, form_types: list, since_year: int) -> list:
-    """Flattens the 'recent' filings block and filters by form type + year."""
-    recent = submissions["filings"]["recent"]
+def get_all_filing_pages(session: requests.Session, submissions: dict) -> list:
+    """Returns every columnar filing block for this filer: the primary
+    'recent' block plus any additional paginated blocks listed in
+    submissions['filings']['files'].
+
+    Real, confirmed bug this fixes: SEC's submissions.json only holds "at
+    least one year's...or 1,000...whichever is more" of a filer's most
+    RECENT filings of ALL form types (10-K, 10-Q, 8-K, proxy statements,
+    everything) in the primary 'recent' block -- not just the form types
+    this project cares about. A filer that submits heavily in OTHER forms
+    (8-Ks, proxy statements -- exactly what large financial institutions
+    and multinationals tend to do) can have its older 10-K/10-Qs pushed
+    out of that window entirely, silently, with no error. An earlier
+    version of this function only ever read 'recent', which meant it
+    quietly under-downloaded exactly this class of filer.
+
+    Confirmed as the real cause on a real run of this project's corpus:
+    AAPL/JNJ/KO/MSFT/PFE/TSLA all downloaded a complete, expected ~19
+    filings each (full 2022-2026 range), while JPM and GS -- both
+    high-filing-volume financial institutions -- only got their most
+    recent 4 filings each (roughly the last year), XOM only got 1 (its
+    single most recent filing), and WMT was missing its earliest ~4-5
+    filings from 2022. All four gaps were at the OLD end of the date
+    range, consistent with exactly this failure mode, and none of them
+    surfaced as an error -- the script completed "successfully" every
+    time, just with an incomplete result for these specific tickers."""
+    pages = [submissions["filings"]["recent"]]
+    for extra in submissions["filings"].get("files", []):
+        resp = session.get(SUBMISSIONS_PAGE_URL.format(name=extra["name"]), timeout=30)
+        resp.raise_for_status()
+        pages.append(resp.json())
+        time.sleep(REQUEST_DELAY_SECONDS)  # this is a real request too -- respect the rate limit
+    return pages
+
+
+def filter_filings(pages: list, form_types: list, since_year: int, cik: int) -> list:
+    """Filters filings by form type + year across every columnar filing
+    block for this filer (see get_all_filing_pages for why there can be
+    more than one). Tags each result with its source `cik`, since a
+    single ticker can now span multiple CIKs (see cik_overrides in
+    config.yaml -- needed when a ticker persisted across a corporate
+    restructuring that changed the underlying legal entity/CIK)."""
     results = []
-    n = len(recent["accessionNumber"])
-    for i in range(n):
-        form = recent["form"][i]
-        filing_date = recent["filingDate"][i]
-        year = int(filing_date[:4])
-        if form in form_types and year >= since_year:
-            results.append({
-                "form": form,
-                "accession_number": recent["accessionNumber"][i],
-                "filing_date": filing_date,
-                "primary_document": recent["primaryDocument"][i],
-                "report_date": recent["reportDate"][i],
-            })
+    for page in pages:
+        n = len(page["accessionNumber"])
+        for i in range(n):
+            form = page["form"][i]
+            filing_date = page["filingDate"][i]
+            year = int(filing_date[:4])
+            if form in form_types and year >= since_year:
+                results.append({
+                    "cik": cik,
+                    "form": form,
+                    "accession_number": page["accessionNumber"][i],
+                    "filing_date": filing_date,
+                    "primary_document": page["primaryDocument"][i],
+                    "report_date": page["reportDate"][i],
+                })
     return results
 
 
-def download_filing(session: requests.Session, cik: int, filing: dict, dest_dir: Path) -> Path:
+def download_filing(session: requests.Session, filing: dict, dest_dir: Path) -> Path:
     accession_nodash = filing["accession_number"].replace("-", "")
     url = ARCHIVE_URL.format(
-        cik=cik, accession_nodash=accession_nodash, filename=filing["primary_document"]
+        cik=filing["cik"], accession_nodash=accession_nodash, filename=filing["primary_document"]
     )
     resp = session.get(url, timeout=30)
     resp.raise_for_status()
@@ -160,32 +202,81 @@ def main():
         if entry is None:
             print(f"  [skip] {ticker}: not found in SEC ticker list")
             continue
-        cik = entry["cik"]
         company_name = entry["name"]
 
-        print(f"Fetching filings for {ticker} ({company_name}, CIK {cik})...")
-        submissions = get_filings_for_cik(session, cik)
-        time.sleep(REQUEST_DELAY_SECONDS)
+        # Normally just the current CIK from company_tickers.json. Some
+        # tickers need more than one -- see cik_overrides in config.yaml
+        # (confirmed real case: XOM persisted across a 2026-07-01
+        # corporate restructuring that changed its underlying CIK,
+        # silently losing pre-restructuring history if only the current
+        # CIK is used).
+        cik_list = config.get("cik_overrides", {}).get(ticker, [entry["cik"]])
 
-        filings = filter_filings(submissions, config["form_types"], config["since_year"])
-        print(f"  found {len(filings)} matching filings")
+        all_filings = []
+        for cik in cik_list:
+            print(f"Fetching filings for {ticker} ({company_name}, CIK {cik})...")
+            submissions = get_filings_for_cik(session, cik)
+            time.sleep(REQUEST_DELAY_SECONDS)
 
-        for filing in filings:
+            pages = get_all_filing_pages(session, submissions)
+            if len(pages) > 1:
+                print(f"  CIK {cik} has {len(pages)} filing pages (high filing volume "
+                      f"in other form types pushed older filings into paginated files)")
+
+            filings = filter_filings(pages, config["form_types"], config["since_year"], cik)
+            print(f"  found {len(filings)} matching filings under CIK {cik}")
+            all_filings.extend(filings)
+
+        if len(cik_list) > 1:
+            # A single filing can legitimately be cross-listed under BOTH
+            # a predecessor and successor CIK around a corporate
+            # restructuring -- confirmed real case: XOM's Q2 2026 10-Q
+            # (accession 0000034088-26-000093, filed shortly after the
+            # 2026-07-01 redomiciliation merger) appeared under both the
+            # old CIK (34088) and the new one (2115436) with otherwise
+            # identical data. Without deduplication, that filing would get
+            # "downloaded" twice under the same output filename (silently
+            # overwriting itself -- no duplicate file on disk, but two
+            # manifest entries and an ambiguous, order-dependent CIK
+            # recorded in its .meta.json sidecar). Deduplicated here by
+            # accession_number, keeping the FIRST occurrence -- given
+            # cik_overrides lists the predecessor CIK before the successor
+            # one, this naturally attributes a cross-listed filing to
+            # whichever CIK's accession-number prefix it actually
+            # originated from, not just whichever happened to process last.
+            seen_accessions = set()
+            deduped_filings = []
+            n_dupes = 0
+            for f in all_filings:
+                if f["accession_number"] in seen_accessions:
+                    n_dupes += 1
+                    continue
+                seen_accessions.add(f["accession_number"])
+                deduped_filings.append(f)
+            if n_dupes:
+                print(f"  {ticker}: removed {n_dupes} filing(s) cross-listed under "
+                      f"multiple CIKs (same accession number)")
+            all_filings = deduped_filings
+
+        if len(cik_list) > 1:
+            print(f"  {ticker} total across {len(cik_list)} CIKs: {len(all_filings)} filings")
+
+        for filing in all_filings:
             try:
                 dest_dir = raw_dir / ticker
-                out_path = download_filing(session, cik, filing, dest_dir)
+                out_path = download_filing(session, filing, dest_dir)
                 time.sleep(REQUEST_DELAY_SECONDS)
 
                 meta = {
                     "ticker": ticker,
                     "company_name": company_name,
-                    "cik": cik,
+                    "cik": filing["cik"],
                     "form_type": filing["form"],
                     "fiscal_period_end": filing["report_date"],
                     "filing_date": filing["filing_date"],
                     "accession_number": filing["accession_number"],
                     "source_url": ARCHIVE_URL.format(
-                        cik=cik,
+                        cik=filing["cik"],
                         accession_nodash=filing["accession_number"].replace("-", ""),
                         filename=filing["primary_document"],
                     ),
