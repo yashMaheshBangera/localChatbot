@@ -16,8 +16,17 @@ Pipeline per filing:
      (e.g. "Item 1. Financial Statements > CONDENSED CONSOLIDATED
      STATEMENTS OF OPERATIONS").
   2. Tables are cleaned (table_cleaner.py): colspan-aware grid reconstruction,
-     empty spacer columns dropped, "$" cells merged into their neighbor --
-     then kept as one atomic chunk per table (never split).
+     empty spacer columns dropped, "$"/"%" cells merged into their neighbor.
+     A table that fits within max_tokens stays one atomic chunk. An
+     oversized table (large multi-year financial statements routinely
+     exceed 512 tokens -- some in this project's real corpus ran past 1400)
+     is split into multiple row-group chunks instead of truncated: never
+     splitting a data row itself, and repeating the detected header rows
+     (period dates, section labels) at the top of every group so column
+     meaning survives the split. This replaced an earlier design where
+     oversized tables were truncated at embedding time, silently discarding
+     everything past the token budget -- for large tables that meant
+     losing over half the content with zero way to retrieve it via search.
   3. Consecutive text blocks under the same section are grouped, then split
      with LangChain's RecursiveCharacterTextSplitter (token-budgeted against
      your embedding model's tokenizer).
@@ -28,13 +37,16 @@ Usage:
 
 Idempotent: filings that already have output chunks are skipped on rerun.
 
-NOTE ON TESTING: the DOM-walking and table-cleaning logic (dom_walker.py,
-table_cleaner.py) were verified against a real downloaded filing. The
-LangChain text-splitting step was written against LangChain's current
-documented API but has NOT been run end-to-end (no network in the dev
-sandbox to install langchain-text-splitters/transformers). Run this on a
-small batch first and spot-check a few "text" chunks before processing your
-whole corpus.
+NOTE ON TESTING: the DOM-walking, table-cleaning, and table row-group-
+splitting logic (dom_walker.py, table_cleaner.py) were verified against
+real downloaded filings, including automated data-integrity checks (every
+original row appears exactly once across split groups, no loss or
+duplication) across multiple budget sizes. The LangChain text-splitting
+step was written against LangChain's current documented API but has NOT
+been run end-to-end in the dev sandbox (no network to install
+langchain-text-splitters/transformers there). Run this on a small batch
+first and spot-check a few "text" chunks before processing your whole
+corpus.
 """
 
 import hashlib
@@ -52,6 +64,13 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from transformers import AutoTokenizer
 
 from dom_walker import build_records
+from table_cleaner import (
+    detect_header_row_count,
+    split_grid_into_row_groups,
+    detect_period_column_groups,
+    split_grid_into_column_groups,
+    grid_to_text,
+)
 
 # This script's own directory -- the starting point for finding config.yaml.
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -122,7 +141,10 @@ def enforce_max_tokens(text: str, tokenizer, max_tokens: int) -> list:
     return pieces
 
 
-def chunk_id_for(local_path: str, index: int) -> str:
+def chunk_id_for(local_path: str, index) -> str:
+    """index can be an int (per-chunk position) or a string (e.g.
+    "table-3", used for table_id -- one per SOURCE table, not per output
+    chunk). Either way, produces a stable, deterministic ID."""
     digest = hashlib.sha1(f"{local_path}:{index}".encode()).hexdigest()[:16]
     return f"chunk_{digest}"
 
@@ -135,30 +157,127 @@ def process_filing(tokenizer, splitter, meta: dict, max_tokens: int) -> list:
 
     records = []
     idx = 0
+    table_block_idx = 0
     for block in blocks:
         if block["type"] == "table":
-            # Tables are intentionally left uncapped/atomic here (never split
-            # mid-row) -- embed_chunks.py handles any table that exceeds the
-            # embedding model's own limit at embedding time, keeping the full
-            # text in the record while flagging embedding_truncated=true.
-            token_count = len(
+            # One table_id per SOURCE table (not per output chunk), shared
+            # across all pieces it gets split into -- lets a future
+            # retrieval step reconstruct the full table by fetching all
+            # chunks with the same table_id, even though each piece is
+            # embedded and searched independently. See README: splitting an
+            # oversized table into separate chunks solves the embedding
+            # blind-spot problem, but without this linking metadata it
+            # trades that for a DIFFERENT loss -- generation only seeing
+            # whichever single group happened to match the query, not the
+            # whole table. Present (group_count=1) even for tables that
+            # didn't need splitting, so the schema is uniform and retrieval
+            # code never needs to special-case "was this table split".
+            table_id = chunk_id_for(meta["local_path"], f"table-{table_block_idx}")
+            table_block_idx += 1
+
+            table_token_count = len(
                 tokenizer.encode(block["content"], truncation=False, add_special_tokens=False)
             )
-            records.append({
-                "chunk_id": chunk_id_for(meta["local_path"], idx),
-                "ticker": meta["ticker"],
-                "company_name": meta["company_name"],
-                "cik": meta["cik"],
-                "form_type": meta["form_type"],
-                "fiscal_period_end": meta["fiscal_period_end"],
-                "filing_date": meta["filing_date"],
-                "source_url": meta["source_url"],
-                "section": block["section"],
-                "chunk_type": "table",
-                "token_count": token_count,
-                "text": block["content"],
-            })
-            idx += 1
+
+            if table_token_count <= max_tokens:
+                # Fits within budget -- stays one atomic chunk, as before.
+                table_pieces = [block["content"]]
+            else:
+                # Oversized: split rather than truncate. See module
+                # docstring for why this replaced embedding-time truncation.
+                grid = block["grid"]
+
+                def count_tokens(text):
+                    return len(tokenizer.encode(text, truncation=False, add_special_tokens=False))
+
+                # Two genuinely different oversized-table shapes, found
+                # from real examples, not anticipated in advance:
+                #   1. Many ROWS (e.g. a 32-row income statement) -- fixed
+                #      by split_grid_into_row_groups, splitting between
+                #      rows and repeating header rows in every group.
+                #   2. Many COLUMNS (e.g. JPMorgan's "Markets revenue"
+                #      table: Fixed Income/Equity/Total Markets x 3 years
+                #      side by side, 22 columns) -- row-splitting can't
+                #      help here, since EVERY row is oversized regardless
+                #      of how few are packed together; the problem is
+                #      column count, not row count. Detected via bare year
+                #      labels ("2025", "2024", "2023") as anchors between
+                #      repeating column groups -- verified against two
+                #      independent real tables (JPMorgan's and, as a
+                #      generalization check, Apple's differently-shaped
+                #      "Products and Services Performance" table), both
+                #      producing correctly-labeled, data-complete
+                #      sub-tables (automated multiset check, not eyeballed).
+                # Column-splitting runs FIRST when detected, since a table
+                # can be both wide AND tall -- each resulting narrower
+                # piece still goes through row-splitting afterward if IT
+                # alone is still oversized.
+                column_groups = detect_period_column_groups(grid)
+                if column_groups:
+                    column_split_grids = split_grid_into_column_groups(grid, column_groups)
+                else:
+                    column_split_grids = [grid]
+
+                table_pieces = []
+                for sub_grid in column_split_grids:
+                    sub_token_count = count_tokens(grid_to_text(sub_grid))
+                    if sub_token_count <= max_tokens:
+                        table_pieces.append(grid_to_text(sub_grid))
+                    else:
+                        header_row_count = detect_header_row_count(sub_grid)
+                        row_groups = split_grid_into_row_groups(
+                            sub_grid, header_row_count, count_tokens, max_tokens
+                        )
+                        table_pieces.extend(grid_to_text(g) for g in row_groups)
+
+                table_pieces = [p for p in table_pieces if p.strip()]  # drop any empty group
+
+            group_count = len(table_pieces)
+            for group_index, piece in enumerate(table_pieces):
+                token_count = len(
+                    tokenizer.encode(piece, truncation=False, add_special_tokens=False)
+                )
+                # This should be rare-to-nonexistent for genuine financial
+                # tables (verified: largest single row across a full 10-K,
+                # 604 rows checked, was ~183 words -- from a narrative audit
+                # discussion, not a numeric table -- comfortably under
+                # budget). But it's only verified against ONE filer; other
+                # tickers/industries (e.g. a bank's collateral schedules)
+                # could plausibly differ. Flagged LOUDLY rather than left to
+                # embed_chunks.py's silent truncation fallback, so if this
+                # ever actually fires, it's immediately visible and can be
+                # fixed properly (grounded in a real example) rather than
+                # speculatively engineered for now.
+                row_too_large = token_count > max_tokens
+                if row_too_large:
+                    tqdm.write(
+                        f"  [ROW TOO LARGE] {meta['ticker']} {meta['form_type']} "
+                        f"{meta['fiscal_period_end']}, section={block['section']!r}: "
+                        f"a single table row (plus header) is {token_count} tokens, "
+                        f"exceeding max_tokens={max_tokens} even before any embedding-"
+                        f"time truncation. This is the rare edge case noted in the "
+                        f"README -- if you see this, it's worth pasting the row content "
+                        f"back for a proper fix rather than relying on truncation."
+                    )
+                records.append({
+                    "chunk_id": chunk_id_for(meta["local_path"], idx),
+                    "ticker": meta["ticker"],
+                    "company_name": meta["company_name"],
+                    "cik": meta["cik"],
+                    "form_type": meta["form_type"],
+                    "fiscal_period_end": meta["fiscal_period_end"],
+                    "filing_date": meta["filing_date"],
+                    "source_url": meta["source_url"],
+                    "section": block["section"],
+                    "chunk_type": "table",
+                    "token_count": token_count,
+                    "row_too_large": row_too_large,
+                    "table_id": table_id,
+                    "group_index": group_index,
+                    "group_count": group_count,
+                    "text": piece,
+                })
+                idx += 1
         else:  # text block -- may need splitting
             pieces = splitter.split_text(block["content"])
             # Defensive re-check: verify the splitter actually respected

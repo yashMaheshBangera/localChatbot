@@ -3,6 +3,55 @@
 Builds the raw document corpus for the financial RAG portfolio project by
 pulling 10-K / 10-Q filings directly from SEC EDGAR.
 
+## Project structure
+
+One task per directory, one shared config:
+
+```
+localChatbot/
+  config.yaml           <- single shared config for the whole pipeline
+  requirements.txt      <- single shared dependency list for the whole pipeline
+  README.md             <- this file
+  data/
+    build_dataset.py
+    raw/                <- created by build_dataset.py
+    processed/          <- created by parse_and_chunk.py
+    embedded/           <- created by embed_chunks.py
+  parsingChunking/
+    parse_and_chunk.py
+    dom_walker.py
+    table_cleaner.py
+    check_token_limits.py
+  embedding/
+    embed_chunks.py
+```
+
+`requirements.txt` belongs at the root for the same reason `config.yaml`
+does: it's a single shared dependency list covering every stage (BS4/lxml
+for parsing, LangChain for chunking, requests/transformers for embedding),
+not owned by any one subdirectory -- move it there alongside `config.yaml`
+if you haven't already.
+
+Every script finds `config.yaml` by searching upward from its own location
+until it finds one (`find_config()` in each script) -- it doesn't matter
+that `build_dataset.py` lives in `data/`, `parse_and_chunk.py` lives in
+`parsingChunking/`, and `embed_chunks.py` lives in `embedding/`, since they all
+walk up to the same project root either way. Data-directory paths inside
+`config.yaml` (`output_dir`, `processed_dir`, `embedded_dir`) are then
+resolved relative to wherever that config file actually lives, not
+relative to any individual script or your terminal's current directory --
+so every script agrees on where `data/raw`, `data/processed`, and
+`data/embedded` are, regardless of which one of them you run or from
+where. Verified by simulating this exact directory layout and running each
+script from its actual location before this was written up.
+
+Commands below assume running from the project root (`localChatbot/`),
+matching where this README and `config.yaml` live -- but since path
+resolution searches upward rather than depending on your current
+directory, `cd parsingChunking && python parse_and_chunk.py` works exactly
+as well as `python parsingChunking/parse_and_chunk.py` from the root.
+Whichever's more convenient in the moment.
+
 ## Why SEC EDGAR
 
 - Free, public, no auth, no scraping gray area — safe to publish alongside
@@ -54,7 +103,7 @@ SEC EDGAR requires a descriptive `User-Agent` with real contact info and
 will block generic ones.
 
 ```bash
-python build_dataset.py
+python data/build_dataset.py
 ```
 
 Expect it to take a few minutes given the rate-limit delay (0.15s between
@@ -113,7 +162,7 @@ retrieval time).
 Once `data/raw/` is populated, run:
 
 ```bash
-python parse_and_chunk.py
+python parsingChunking/parse_and_chunk.py
 ```
 
 This is a hand-built parser (`dom_walker.py` + `table_cleaner.py`), not a
@@ -199,6 +248,140 @@ into its RIGHT neighbor, since `$` is a leading prefix and `%` is a
 trailing suffix). Verified: zero standalone `%` cells remain across all
 55 tables in the sampled 10-K after the fix, down from 7.
 
+**Row-group splitting for oversized tables:** large multi-year financial
+statements routinely exceed the 512-token budget -- some tables in this
+project's real corpus ran past 1400 tokens. The original design kept
+tables atomic (never split, to avoid breaking a row) and left oversized
+ones to be truncated at embedding time -- but for a 1400-token table
+truncated to ~504, that meant silently discarding almost two-thirds of
+its content, with zero way to retrieve the discarded part via search (the
+embedding vector has no information about it at all, not even
+approximately). Replaced with proper splitting: `detect_header_row_count()`
+identifies leading rows with no numeric data (period-date headers,
+section titles like "Net sales:" -- reusing the same `_NUMERIC_CELL`
+classifier behind the right-alignment fix) and `split_grid_into_row_groups()`
+packs data rows into multiple chunks, repeating those header rows at the
+top of each group so column/period meaning survives the split, splitting
+only *between* rows, never mid-row. Verified against a real 32-row, ~727-
+token income statement (3 fiscal years) across several budget sizes: every
+original row appears exactly once across the resulting groups (automated
+equality check, not eyeballed), and every group stays within budget.
+
+**The remaining edge case -- a single row too large even with its
+header.** Initially checked how real this risk was on Apple's 10-K alone:
+across 604 non-empty rows, the largest was ~183 words, from a narrative
+audit discussion, not a numeric table -- suggesting the case might be
+rare-to-nonexistent. That hypothesis didn't survive contact with the rest
+of the corpus: running the full 10-ticker set surfaced it repeatedly on
+JPM, KO, and PFE. Two distinct real patterns emerged (found by scanning
+actual flagged rows, not guessed at):
+
+1. **Genuinely wide tables** (e.g. JPM's "Markets revenue": Fixed Income
+   Markets / Equity Markets / Total Markets reported for 2025, 2024, and
+   2023 side by side -- 22 columns in one row) -- a structurally different
+   problem than "too many rows"; row-splitting can't help here, since
+   every row is oversized regardless of how few are packed together, the
+   problem is column count. **Status: fixed.**
+   `detect_period_column_groups()` finds repeating period groups anchored
+   on bare year labels ("2025", "2024", "2023" -- deliberately distinct
+   from `detect_header_row_count()`'s date handling, since a bare year
+   matches `_NUMERIC_CELL` and wouldn't be caught as a header by that
+   function). `split_grid_into_column_groups()` then splits the table into
+   one complete, correctly-labeled sub-table per period -- column 0 (the
+   row label) is repeated in every group, so each piece stands alone as a
+   full "2025 Markets revenue breakdown" rather than a column slice
+   missing its labels. This runs as a pre-step before row-splitting, since
+   a table can be both wide AND tall: each resulting narrower group still
+   goes through `split_grid_into_row_groups()` afterward if it alone is
+   still oversized. Verified against two independent real tables -- JPM's
+   original case, and (as a generalization check, not overfitting to one
+   example) Apple's differently-shaped "Products and Services Performance"
+   table -- both producing an exact multiset match between original and
+   reconstructed data cells (excluding the intentionally-repeated label
+   column): no loss, no duplication, not eyeballed. Full end-to-end
+   integration verified too: JPM's real table run through the actual
+   `process_filing()` function produced 12 correctly-linked chunks (one
+   `table_id`, sequential `group_index`), none needing the
+   `row_too_large` fallback.
+2. **A narrative explanation crammed into one cell of an otherwise short
+   row** (e.g. Pfizer's product-revenue table: five short numeric cells
+   followed by one cell containing a full paragraph explaining the
+   revenue driver; Coca-Cola's "Critical Audit Matters" hit this every
+   year 2021-2025). **Status: fixed.** `split_oversized_row()` finds the
+   dominant cell in an oversized row and splits ONLY that cell's content
+   (`_split_text_into_pieces()`, preferring bullet-point boundaries, then
+   sentence boundaries, then a hard word-count split as a last resort),
+   producing multiple sub-rows that each repeat the row's other short
+   cells alongside just one piece of the narrative -- so context (which
+   product, which numbers) isn't lost. `split_grid_into_row_groups()` runs
+   this as a pre-processing pass before packing rows into groups. Verified
+   against the real Pfizer Paxlovid row: split into 4 sub-rows, and an
+   automated check confirms the narrative content reconstructs word-for-
+   word across those sub-rows with zero loss or duplication -- not just
+   eyeballed. This is now a permanent regression test in
+   `table_cleaner.py`.
+
+   **A related bug this surfaced**: Pfizer's narrative cell happened to
+   use bullet points, so the sentence-boundary fallback path in
+   `_split_text_into_pieces()` went untested by that example. Testing a
+   *different* real "row too large" warning -- Coca-Cola's "Critical
+   Audit Matters" text, continuous prose with no bullets -- found the
+   naive sentence-splitting regex incorrectly treated abbreviations like
+   "U.S." as sentence ends, breaking a real sentence in half ("...the
+   U.S." | "Tax Court issued an opinion..."). No data was lost (the
+   word-for-word check still passed), but the split point was wrong,
+   which would degrade retrieval/generation quality on any prose
+   containing common abbreviations. Fixed with `_split_into_sentences()`:
+   skips a candidate split point when the word immediately before the
+   period is very short (<=2 letters -- catches "U.S.", "U.K.", "Mr",
+   "Dr" without needing each one individually listed) or matches a small
+   list of common longer abbreviations the length check alone wouldn't
+   catch ("Inc.", "Corp.", "etc."). Verified against the real KO row:
+   "the U.S. Tax Court...for tax years 2007 through 2009." now stays
+   together as one sentence, confirmed by an explicit check that no
+   sub-row ends mid-sentence at "U.S." -- also now a permanent regression
+   test.
+
+With both patterns fixed, `parse_and_chunk.py` still prints an unmissable
+`[ROW TOO LARGE]` warning naming the ticker/section/token count for the
+residual case where a row remains oversized even after both fixes are
+attempted (a dominant cell with no usable split boundary, or some
+not-yet-seen third pattern), every table chunk carries a queryable
+`row_too_large` boolean, and `check_token_limits.py` summarizes these
+across the whole corpus after a run -- so the true remaining extent
+across all 10 tickers is known, not assumed, and any genuinely new
+pattern still surfaces loudly rather than silently degrading.
+
+*A note on process, in the interest of being straightforward about it:
+the narrative-cell fix above was built in an earlier working session but
+wasn't actually verified or delivered at the time -- it existed as
+untested code that never made it into the files being handed over. Caught
+and fixed by re-checking the actual file contents against what had been
+delivered, rather than assuming prior described work was complete.*
+
+**Sibling-linking metadata (`table_id` / `group_index` / `group_count`):**
+splitting an oversized table into multiple chunks solves the embedding
+blind-spot problem (each piece gets an accurate, untruncated vector) but
+introduces a different loss if left unaddressed: at generation time, only
+whichever single group matched the query gets retrieved -- the LLM never
+sees the table's other groups, even though they're the same table, same
+topic. The standard fix for this in RAG system design is "parent-document"
+or "auto-merging" retrieval: search precisely at the individual-chunk
+level, but at generation time reconstruct the full table by pulling in
+sibling chunks. That merging logic belongs in the retrieval/query step
+(not yet built), but the metadata it depends on is generated here, since
+it comes directly from the splitting logic -- retrofitting it after the
+whole corpus is already embedded and loaded would mean redoing this work.
+Every table chunk (split or not) carries `table_id` (one per source
+`<table>`, shared across all its pieces), `group_index` (0-based position
+within that table), and `group_count` (total pieces, `1` for tables that
+didn't need splitting) -- a uniform schema so retrieval code never needs
+to special-case whether a given table was split. Verified with an
+integration test: a small table correctly gets `group_count=1`; a large
+one splits into multiple chunks all sharing one `table_id` with
+sequential `group_index`; two different source tables get different
+`table_id`s.
+
 **Numeric right-alignment fix:** an earlier version of this cleaner left a
 cosmetic misalignment where rows without a `$` prefix (e.g. "Services")
 landed one column left of rows that had one (e.g. "Products"). Root cause:
@@ -240,9 +423,29 @@ Each line in a `.chunks.jsonl` file is one chunk record:
   "section": "Item 1. Financial Statements > CONDENSED CONSOLIDATED STATEMENTS OF OPERATIONS (Unaudited)",
   "chunk_type": "table",
   "token_count": 187,
+  "row_too_large": false,
+  "table_id": "chunk_a1b2c3d4e5f6a7b8",
+  "group_index": 0,
+  "group_count": 1,
   "text": "..."
 }
 ```
+
+`row_too_large` is only meaningful for `chunk_type: "table"` -- `true`
+only when a single row still exceeds `max_tokens` even after
+`split_oversized_row()` has tried to fix it (currently: the wide-table
+case, not yet handled, or the rare residual where a dominant cell has no
+usable split boundary). `false` for every normal chunk, including ones
+from a successfully-split oversized table -- that's the expected, working
+path, not the edge case.
+
+`table_id` / `group_index` / `group_count` (also table-only) identify
+which source `<table>` a chunk came from and its position among that
+table's pieces -- present and uniform (`group_count: 1` for tables that
+didn't need splitting) so a future retrieval step can reconstruct a full
+table from its parts regardless of whether splitting happened. See
+"Sibling-linking metadata" above for why this exists now rather than
+being deferred to the retrieval step.
 
 ## Embedding
 
@@ -257,7 +460,7 @@ vllm serve BAAI/bge-large-en-v1.5 --task embed
 Then run:
 
 ```bash
-python embed_chunks.py
+python embedding/embed_chunks.py
 ```
 
 This calls vLLM's OpenAI-compatible `/v1/embeddings` endpoint directly over
@@ -271,16 +474,41 @@ with the model's own correct tokenizer server-side, avoiding the mismatch
 entirely.
 
 **Oversized chunks:** bge-large-en-v1.5 has a hard 512-token limit, and
-vLLM errors rather than silently truncating. Table chunks are kept atomic
-and unsplit (by design, from the parsing stage), so a large table can
-plausibly exceed 512 tokens. `embed_chunks.py` checks token length before
-sending and truncates with a logged warning when needed -- but critically,
+vLLM errors rather than silently truncating. Tables are now split into
+row-groups at *parse* time when oversized (see the parsing section above)
+rather than left atomic and truncated here -- so this truncation path is
+now a rare fallback, not the primary mechanism, only hit by the edge case
+of a single row too large to fit even with its header. When it does fire,
 only the *embedding* is computed from the truncated version; the record's
-`text` field keeps the full original. That means retrieval finds the
-chunk via an imperfect-but-usable vector, while generation still sees the
-complete table, not a truncated one. Each output record has an explicit
-`embedding_truncated` boolean so this is visible rather than silent, and
-retrieval/eval code can account for it later if needed.
+`text` field keeps the full original, so retrieval still finds the chunk
+via an imperfect-but-usable vector while generation sees the complete
+row. Each output record has an explicit `embedding_truncated` boolean so
+this stays visible rather than silent.
+
+**Special-token buffer, found from a real production failure (not
+anticipated in advance):** running against the full 137-filing corpus
+produced `0` chunks embedded despite the run completing -- every request
+failed with `400 Bad Request`, and it finished suspiciously fast (every
+call rejected near-instantly, not actually running inference). Root
+cause: the length check originally counted tokens without
+`add_special_tokens=False`, inconsistent with `parse_and_chunk.py` (which
+always passes it explicitly) -- for a BERT-family tokenizer, the default
+silently adds `[CLS]`/`[SEP]` (2 extra tokens). But the deeper issue
+wasn't just local miscounting: vLLM's *server* also adds its own
+`[CLS]`/`[SEP]` when tokenizing raw text before checking it against the
+512-token limit. Since `parse_and_chunk.py` targets exactly 512 content
+tokens per chunk (the configured `chunk_size`), nearly every chunk sat
+right at that boundary -- so once the server added its own 2 specials on
+top, virtually everything exceeded the true limit and got rejected,
+regardless of whether this script's own check had flagged it as
+oversized. Fixed by reserving an 8-token safety buffer
+(`SPECIAL_TOKEN_BUFFER`) below `max_tokens`, applied uniformly to every
+chunk rather than only ones already far over budget. Also fixed:
+`embed_batch()` previously discarded the HTTP response body on error
+(`resp.raise_for_status()` only gives a bare status code) -- it now
+surfaces vLLM's actual diagnostic message, which is what makes failures
+like this actually debuggable instead of requiring inference from
+symptoms alone.
 
 Output mirrors `data/processed/`'s structure under `data/embedded/`, same
 idempotent-skip behavior as the earlier stages.

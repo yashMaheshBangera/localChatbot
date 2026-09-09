@@ -1,5 +1,8 @@
 """
-Verify that no "text" chunk in data/processed/ exceeds max_tokens.
+Verify that no "text" chunk in data/processed/ exceeds max_tokens, and
+report any "row_too_large" table chunks (the rare pathological edge case
+where a single table row exceeds max_tokens even with its header -- see
+README's "Row-group splitting for oversized tables").
 
 Run this after parse_and_chunk.py to get a definitive answer -- rather than
 inferring it from whether the "Token indices sequence length..." warning
@@ -22,8 +25,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 def find_config(start: Path, filename: str = "config.yaml", max_levels: int = 6) -> Path:
     """Searches upward from `start` through parent directories for the
     shared project config. Scripts live in different task-specific
-    subdirectories (data/, parsingChunking/, embed/, ...) while config.yaml
-    lives once at the shared project root."""
+    subdirectories (data/, parsingChunking/, embedding/, ...) while
+    config.yaml lives once at the shared project root."""
     current = start
     for _ in range(max_levels):
         candidate = current / filename
@@ -49,6 +52,7 @@ def main():
     max_tokens = config["max_tokens"]
 
     violations = []
+    row_too_large_chunks = []
     total_text_chunks = 0
     total_table_chunks = 0
     missing_token_count = 0
@@ -71,6 +75,8 @@ def main():
                         violations.append((path, line_num, record))
                 else:
                     total_table_chunks += 1  # tables are intentionally uncapped
+                    if record.get("row_too_large"):
+                        row_too_large_chunks.append((path, line_num, record))
 
     print(f"Checked {total_text_chunks} text chunks, {total_table_chunks} table chunks "
           f"(max_tokens={max_tokens})")
@@ -95,6 +101,22 @@ def main():
     else:
         print(f"\n[PASS] Checked {total_text_chunks} text chunks, all within "
               f"{max_tokens} tokens. The defensive hard-cap is working correctly.")
+
+    if row_too_large_chunks:
+        print(f"\n[NOTE] {len(row_too_large_chunks)} table chunk(s) hit the rare "
+              f"'single row too large even with header' edge case (verified rare-to-"
+              f"nonexistent on Apple's 10-K, but not yet checked against your other "
+              f"9 tickers -- see README). These fall back to embed_chunks.py's "
+              f"truncation. Worth inspecting for a proper fix:")
+        for path, line_num, record in row_too_large_chunks[:10]:
+            print(f"  {path} line {line_num}: chunk_id={record['chunk_id']} "
+                  f"ticker={record['ticker']} section={record['section']!r} "
+                  f"token_count={record['token_count']}")
+        if len(row_too_large_chunks) > 10:
+            print(f"  ...and {len(row_too_large_chunks) - 10} more")
+    else:
+        print(f"\n[OK] No 'row too large' table chunks found -- the edge case "
+              f"didn't occur anywhere in this corpus.")
 
 
 if __name__ == "__main__":
