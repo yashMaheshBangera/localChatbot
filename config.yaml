@@ -4,12 +4,13 @@
 user_agent: "Yash <your_email@example.com> - RAG portfolio project"
 
 # Where downloaded filings + metadata sidecars are written.
-# NOTE: relative paths here are resolved against whatever directory you run
-# the scripts FROM, not against this file's location. This project's layout
-# has data/ as a sibling of the scripts (parsingChunking/../data), so paths
-# use "../" -- assumes you always run scripts with parsingChunking/ as your
-# working directory (cd into it first), consistent throughout this project.
-output_dir: "../data/raw"
+# Resolved relative to THIS FILE's own location (the project root), not
+# relative to whichever script reads it or where you run python from --
+# see find_config()/resolve_dir() in each script. This project's layout has
+# one config.yaml at the root, with each pipeline stage in its own
+# subdirectory (data/, parsingChunking/, embed/, ...) that finds this file
+# by searching upward from itself.
+output_dir: "data/raw"
 
 # Only pull filings from this year onward
 since_year: 2022
@@ -32,10 +33,32 @@ tickers:
   - KO     # Consumer staples
   - TSLA   # Automotive / industrials
 
+# Full list of CIKs to use per ticker, REPLACING the default single-CIK
+# lookup from company_tickers.json entirely for any ticker listed here (not
+# additive -- list every CIK you want included, current one too). Needed
+# when a ticker has persisted across a corporate restructuring that
+# changed the underlying legal entity/CIK -- the current ticker->CIK
+# mapping only reflects the CURRENT entity, silently losing all
+# pre-restructuring history under the old CIK.
+#
+# Confirmed real case: ExxonMobil completed a "redomiciliation merger" on
+# 2026-07-01, reorganizing from "Exxon Mobil Corporation" (New Jersey
+# corp, CIK 34088) into a new entity, "ExxonMobil Holdings Corporation"
+# (Texas corp, CIK 2115436), which now trades under the same "XOM" ticker.
+# company_tickers.json's current XOM entry resolves to the NEW CIK, which
+# only has filing history from around the merger date onward -- without
+# this override, XOM's corpus coverage would be limited to ~1 filing
+# instead of its real 2022-2026 history under the predecessor entity.
+cik_overrides:
+  XOM:
+    - 34088     # Exxon Mobil Corporation (pre-2026-07-01, New Jersey)
+    - 2115436   # ExxonMobil Holdings Corporation (post-2026-07-01, Texas) -- current
+
+
 # --- Parsing / chunking stage ---
 
 # Where parsed + chunked output (JSONL) is written
-processed_dir: "../data/processed"
+processed_dir: "data/processed"
 
 # Tokenizer to size chunks against. Should match (or closely approximate)
 # whatever embedding model you plan to use downstream, since that's what
@@ -58,7 +81,7 @@ max_tokens: 512
 # --- Embedding stage ---
 
 # Where embedded chunks (chunk record + "embedding" vector) are written
-embedded_dir: "../data/embedded"
+embedded_dir: "data/embedded"
 
 # vLLM server URL. Start it first, in a separate terminal:
 #   vllm serve BAAI/bge-large-en-v1.5 --runner pooling
@@ -71,3 +94,59 @@ vllm_api_key: null
 # larger payloads; 32 is a reasonable starting point to tune against your
 # hardware.
 embedding_batch_size: 32
+
+# --- Vector store (Qdrant) stage ---
+
+# Qdrant server URL. Run it natively in WSL2 first (not Docker with a
+# Windows bind mount -- known data corruption risk, see README):
+#   cd ~/qdrant && ./qdrant
+qdrant_url: "http://localhost:6333"
+
+# Only needed if Qdrant was started with an API key configured; leave null
+# for a local, unauthenticated instance.
+qdrant_api_key: null
+
+collection_name: "sec_filings"
+
+# Points per upsert request. Larger batches = fewer round trips but bigger
+# payloads (each point carries a 1024-float vector, so this adds up fast).
+qdrant_batch_size: 256
+
+# --- Optional re-ranking stage (retrieve.py --rerank, run_retrieval_eval.py --rerank) ---
+
+# A second vLLM instance, separate from the embedding server, serving a
+# cross-encoder reranker -- e.g.:
+#   vllm serve BAAI/bge-reranker-base --port 8001
+# Only needed if you actually use --rerank; plain dense retrieval doesn't
+# touch this at all.
+reranker_base_url: "http://localhost:8001"
+reranker_model_id: "BAAI/bge-reranker-base"
+reranker_api_key: null
+
+# --- Generation stage (generation/generate.py) ---
+
+# A third vLLM instance, separate from embedding and reranker, serving
+# the generation LLM. No quantization -- full bf16 precision, kept small
+# enough to fit via --max-model-len and --enforce-eager instead. This
+# was the FINAL working config after four other real, confirmed
+# incompatibilities on vLLM 0.28.0 (a very recent build): a UVA error, a
+# missing CUDA compiler, a pre-quantized checkpoint's version mismatch
+# with an unstable "prototype" torchao module, and bitsandbytes support
+# being deliberately migrated out of vLLM's core as of this exact
+# version (confirmed via vLLM's own v0.28.0 release notes). Rather than
+# keep chasing quantization-method compatibility on a fast-moving vLLM
+# version, dropped quantization entirely: Phi-4-mini is small enough
+# (3.8B, ~7.17GB bf16 weights, confirmed exact from vLLM's own load log)
+# that it fits without it, once CUDA graph capture -- a real, sizeable,
+# hard-to-predict memory consumer, confirmed by --enforce-eager reducing
+# that specific component to exactly 0.0 GiB -- and the 128K context
+# default (unnecessary for this project's actual usage: ~10 retrieved
+# chunks x ~500 tokens each, nowhere near 128K) are both removed from the
+# memory budget. See README's "Troubleshooting" section for the full
+# five-incident story, including the exact arithmetic that led to 0.8.
+#   VLLM_USE_V2_MODEL_RUNNER=0 VLLM_USE_FLASHINFER_SAMPLER=0 \
+#     vllm serve microsoft/Phi-4-mini-instruct --port 8002 \
+#     --gpu-memory-utilization 0.8 --max-model-len 8192 --enforce-eager
+generation_base_url: "http://localhost:8002"
+generation_model_id: "microsoft/Phi-4-mini-instruct"
+generation_api_key: null
