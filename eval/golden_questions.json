@@ -1,0 +1,133 @@
+[
+  {
+    "id": "q1",
+    "question": "What was Apple's total gross margin in fiscal year 2022?",
+    "ticker": "AAPL",
+    "form_type": "10-K",
+    "expected_answer": "$170,782 million",
+    "expected_context_contains": "170,782",
+    "verification_method": "raw_html",
+    "source": "AAPL 10-K FY2022, Item 7 Gross Margin table -- independently verified against the raw source HTML (BeautifulSoup, table_cleaner.py testing), separate from the pipeline being evaluated. Also independently confirmed again via a live retrieve.py query during this project."
+  },
+  {
+    "id": "q2",
+    "question": "What was Apple's total gross margin in fiscal year 2023?",
+    "ticker": "AAPL",
+    "form_type": "10-K",
+    "expected_answer": "$169,148 million",
+    "expected_context_contains": "169,148",
+    "verification_method": "raw_html",
+    "source": "AAPL 10-K FY2023, Item 7 Gross Margin table -- same table family as q1, different fiscal year, confirms retrieval distinguishes between years correctly rather than just matching on 'gross margin' generically. Verified against raw source HTML."
+  },
+  {
+    "id": "q3",
+    "question": "What was Pfizer's total Paxlovid revenue and what drove the change?",
+    "ticker": "PFE",
+    "form_type": "10-K",
+    "expected_answer": "$2,362 million, down 59% operationally, driven by lower COVID-19 infections",
+    "expected_context_contains": "2,362",
+    "verification_method": "raw_html",
+    "source": "PFE 10-K, product revenue table -- the exact real row that motivated split_oversized_row() (a dominant narrative cell explaining the revenue driver, alongside short numeric cells). Verified against raw source HTML."
+  },
+  {
+    "id": "q4",
+    "question": "What was Johnson & Johnson's unrecognized tax benefit related to impairments for fiscal years 2022 and 2023?",
+    "ticker": "JNJ",
+    "form_type": "10-K",
+    "expected_answer": "$51 million (2023) and $28 million (2022) of changes in fair value were the result of impairments",
+    "expected_context_contains": "51",
+    "verification_method": "pipeline_retrieval",
+    "source": "JNJ 10-K 2023-01-01, Item 7A fair value measurements narrative -- CAVEAT: sourced from a live retrieve.py query result (this project's own pipeline output), NOT independently verified against JNJ's raw source HTML (never had that file directly). This is a weaker form of verification than q1/q2/q3/q5/q6 -- using the pipeline's own output as ground truth for evaluating that same pipeline is somewhat circular. Should be upgraded to raw_html verification if JNJ's source HTML becomes available."
+  },
+  {
+    "id": "q5",
+    "question": "What was the gross amount of Coca-Cola's unrecognized tax benefits as of December 31, 2022, related to uncertain tax positions?",
+    "ticker": "KO",
+    "form_type": "10-K",
+    "expected_answer": "$926 million",
+    "expected_context_contains": "926",
+    "verification_method": "raw_html",
+    "source": "KO 10-K 2022-12-31, Critical Audit Matters -- the exact real text that motivated the abbreviation-aware sentence-splitting fix (contains 'U.S.' mid-paragraph). Verified against raw source HTML."
+  },
+  {
+    "id": "q6",
+    "question": "What was JPMorgan's Fixed Income Markets principal transactions revenue in 2025?",
+    "ticker": "JPM",
+    "form_type": "10-K",
+    "expected_answer": "$12,327 million",
+    "expected_context_contains": "12,327",
+    "verification_method": "raw_html",
+    "source": "JPM 10-K 2025-12-31, Markets revenue table -- the exact real table that motivated column-group splitting (22-column wide table, Fixed Income/Equity/Total Markets x 3 years). Verified against raw source HTML."
+  },
+  {
+    "id": "q7",
+    "question": "What were Walmart's total revenues for fiscal year 2024?",
+    "ticker": "WMT",
+    "form_type": "10-K",
+    "expected_answer": "$648,125 million",
+    "expected_context_contains": "648,125",
+    "verification_method": "raw_html",
+    "source": "WMT 10-K FY2024 (period ended 2024-01-31), revenue summary table -- verified against raw source HTML. Also confirms the pipeline correctly handles a Workiva-generated filing with NO explicit 'Workiva'/'Wdesk' header comment (unlike every other Workiva filing tested so far, which self-identified) -- structure was confirmed div-based by direct inspection rather than trusting the presence/absence of that comment."
+  },
+  {
+    "id": "q8",
+    "question": "What were Tesla's total revenues for fiscal year 2021?",
+    "ticker": "TSLA",
+    "form_type": "10-K",
+    "expected_answer": "$53,823 million",
+    "expected_context_contains": "53,823",
+    "verification_method": "raw_html",
+    "source": "TSLA 10-K FY2021, total revenues summary table -- verified against raw source HTML. Tesla's filings are prepared by DFIN (Donnelly Financial Solutions), not Workiva -- the filing that surfaced the real <p>-vs-<div> content-loss bug in dom_walker.py (87% of text was being silently missed before the fix). This question specifically tests that the fix actually works end-to-end through the real pipeline, not just in the standalone dom_walker.py regression test."
+  },
+  {
+    "id": "q9",
+    "question": "What were Walmart's total revenues for the three months ended April 30, 2023?",
+    "ticker": "WMT",
+    "form_type": "10-Q",
+    "expected_answer": "$152,301 million",
+    "expected_context_contains": "152,301",
+    "verification_method": "raw_html",
+    "source": "WMT 10-Q for the quarter ended 2023-04-30, revenue summary table -- verified against raw source HTML. First 10-Q-form-type entry in the golden set (every prior question was 10-K)."
+  },
+  {
+    "id": "q10",
+    "question": "What were Tesla's total revenues for the three months ended March 31, 2022?",
+    "ticker": "TSLA",
+    "form_type": "10-Q",
+    "expected_answer": "$18,756 million",
+    "expected_context_contains": "18,756",
+    "verification_method": "raw_html",
+    "source": "TSLA 10-Q for the quarter ended 2022-03-31, revenue summary table -- verified against raw source HTML. Second 10-Q entry; also DFIN-prepared like TSLA's 10-K, another check that the <p>-tag fix holds up on a second Tesla filing, not just the one that originally surfaced the bug."
+  },
+  {
+    "id": "q11",
+    "question": "What was Microsoft's total revenue for fiscal year 2022?",
+    "ticker": "MSFT",
+    "form_type": "10-K",
+    "expected_answer": "$198,270 million",
+    "expected_context_contains": "198,270",
+    "verification_method": "raw_html",
+    "source": "MSFT 10-K FY2022, income statement -- verified against raw source HTML. Also DFIN-generated (same preparer as Tesla), but surfaced a SECOND, distinct heading-detection bug from Tesla's: MSFT's DFIN template applies bold styling directly on the <p> element's own style attribute rather than via a nested <span>, which the <p>-tag fix alone didn't catch. Fixed by also checking is_bold_span() on the container element itself. This question tests that fix end-to-end through the real pipeline."
+  },
+  {
+    "id": "q12",
+    "question": "What was Goldman Sachs' net revenues for fiscal year 2025?",
+    "ticker": "GS",
+    "form_type": "10-K",
+    "expected_answer": "$58,283 million",
+    "expected_context_contains": "58,283",
+    "verification_method": "raw_html",
+    "source": "GS 10-K FY2025, financial highlights table -- verified against raw source HTML. Workiva-generated, no new structural issues found -- confirms the pipeline handles GS's specific table conventions (financial-services-style metrics: ROE, ROTE, diluted EPS) correctly without needing any new fix."
+  },
+  {
+    "id": "q13",
+    "question": "What were ExxonMobil's total revenues and other income for the three months ended June 30, 2026?",
+    "ticker": "XOM",
+    "form_type": "10-Q",
+    "expected_answer": "$116,017 million",
+    "expected_context_contains": "116,017",
+    "verification_method": "raw_html",
+    "source": "XOM 10-Q for the quarter ended 2026-06-30, income statement -- verified against raw source HTML. Workiva-generated. Uses a different table convention than most other tickers tested (no per-cell $ prefix, just plain numbers under a units header) -- confirmed table_cleaner.py handles this correctly since there was nothing requiring the $ merge logic to fire. Completes coverage of all 10 original tickers."
+  }
+]
+
