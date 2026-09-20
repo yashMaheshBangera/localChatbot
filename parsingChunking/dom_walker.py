@@ -7,6 +7,7 @@ that motivated this design.
 """
 
 from bs4 import BeautifulSoup, NavigableString
+import re
 import warnings
 from bs4 import XMLParsedAsHTMLWarning
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
@@ -29,21 +30,86 @@ def classify_block(element):
     <p> vs. only 62,946 in <div> in a real 10-K, meaning the div-only
     version was silently missing ~87% of the document's text, not just
     section headings. This function works identically for either tag,
-    called on both in walk_blocks() below."""
+    called on both in walk_blocks() below.
+
+    Checks for bold styling in TWO places, not just one -- a second real
+    gap, found on Microsoft's DFIN-generated filings. Workiva (and Tesla's
+    DFIN template) wrap heading text in a nested <span style="...bold...">
+    inside the container; Microsoft's DFIN template instead puts the bold
+    style directly on the <p> element itself
+    (<p style="...font-weight:bold...">TEXT</p>, no span at all). A
+    version that only checked descendant spans found zero headings on
+    MSFT's filing despite it clearly having them -- is_bold_span() is
+    actually a generic style-string check (despite its name), so it's
+    called here on the element itself as well as on any nested spans."""
     if element.find('table'):
         return None  # container that wraps a table -- don't treat as text
     full_text = element.get_text(strip=True)
     if not full_text:
         return None
 
-    spans = element.find_all('span')
-    if spans and len(full_text) <= 150:
-        bold_text = ''.join(s.get_text() for s in spans if is_bold_span(s))
-        non_bold_text = ''.join(s.get_text() for s in spans if not is_bold_span(s))
-        if bold_text.strip() and not non_bold_text.strip():
-            return ('heading', full_text)
+    if len(full_text) <= 150:
+        spans = element.find_all('span')
+
+        if is_bold_span(element):
+            # Bold applied at the container level. Only an explicit
+            # non-bold override in a nested span should disqualify this
+            # from being a heading (e.g. a mostly-bold line with one
+            # incidental non-bold word/footnote marker inside it).
+            non_bold_override = ''.join(s.get_text() for s in spans if not is_bold_span(s))
+            if not non_bold_override.strip():
+                return ('heading', full_text)
+        elif spans:
+            # Bold applied via nested spans instead (Workiva's convention,
+            # and Tesla's <p><a><span style="...bold...">).
+            bold_text = ''.join(s.get_text() for s in spans if is_bold_span(s))
+            non_bold_text = ''.join(s.get_text() for s in spans if not is_bold_span(s))
+            if bold_text.strip() and not non_bold_text.strip():
+                return ('heading', full_text)
 
     return ('text', full_text)
+
+
+_INLINE_SUBHEADING_PATTERN = re.compile(r"^([A-Z][A-Za-z ]{2,40}?)\.(?=[A-Z])")
+
+
+def split_inline_subheading(text):
+    """Detects a bold lead-in glued onto the front of a longer paragraph
+    in the SAME block, e.g. "Net Interest Income.Net interest income in
+    the consolidated statements..." -> ("Net Interest Income", "Net
+    interest income in the consolidated statements...").
+
+    Real, confirmed gap this fixes: classify_block()'s heading detection
+    only fires when len(full_text) <= 150 AND the entire block is bold --
+    correctly designed for a standalone short heading block, but it never
+    even reaches the bold-check for a block like this one, which is a
+    single long paragraph (usually well over 150 chars) where only the
+    first few words are bold and the rest continues as ordinary prose in
+    the SAME block. Confirmed as a real, non-hypothetical problem via a
+    genuine generation error (a chunk's section metadata said "Net
+    Revenues" -- the parent section -- when the chunk's actual content
+    was the "Net Interest Income" subsection, contributing to the model
+    answering a net-revenues question with a net-interest-income figure)
+    and confirmed non-rare via a corpus-wide count: 886 of 49,207 text
+    chunks (1.8%) match this pattern -- roughly 4-5 per filing on
+    average, not a one-off.
+
+    Uses the same regex as generate.py's extract_subheading() -- same
+    validated pattern (tested against the real failing case plus false
+    positives like "U.S.Government..." and ordinary prose), applied here
+    at parse time instead of generation time so every downstream
+    consumer of chunk metadata (retrieve.py, diagnose_misses.py,
+    generate.py, eval reports) sees the correct, complete section path,
+    not just the one place a patch happened to be added first.
+
+    Returns (heading, remaining_text) if the pattern matches, or
+    (None, text) unchanged otherwise."""
+    match = _INLINE_SUBHEADING_PATTERN.match(text)
+    if match:
+        heading = match.group(1).strip()
+        remaining = text[match.end(1) + 1:]  # +1 skips the period itself
+        return heading, remaining
+    return None, text
 
 
 def walk_blocks(soup):
@@ -61,6 +127,13 @@ def walk_blocks(soup):
     (or vice versa) is captured once, as part of the outer element's full
     text, not double-counted. Verified no regression on Workiva-generated
     filings (which use <div> almost exclusively) after adding <p> handling.
+
+    A ('text', ...) result is additionally checked for an inline bold
+    lead-in (see split_inline_subheading) -- when found, a ('heading', ...)
+    is yielded first, then the remaining text, so a bold-lead-in-glued-onto-
+    a-paragraph block behaves like the two separate blocks it structurally
+    represents, feeding section_l2 tracking in parse_and_chunk.py correctly
+    without that module needing any changes of its own.
     """
     body = soup.body or soup
 
@@ -80,6 +153,14 @@ def walk_blocks(soup):
             if child.name in ('div', 'p'):
                 result = classify_block(child)
                 if result is not None:
+                    kind, content = result
+                    if kind == 'text':
+                        heading, remaining = split_inline_subheading(content)
+                        if heading is not None:
+                            yield ('heading', heading)
+                            if remaining.strip():
+                                yield ('text', remaining)
+                            continue
                     yield result
                     continue
                 # container (no direct text, or wraps a table) -- recurse
@@ -91,7 +172,7 @@ def walk_blocks(soup):
     yield from _walk(body)
 
 
-HEADING_LEVEL_1 = __import__('re').compile(r'^(PART\s|Item\s+\d)', __import__('re').IGNORECASE)
+HEADING_LEVEL_1 = re.compile(r'^(PART\s|Item\s+\d)', re.IGNORECASE)
 
 
 def build_records(soup):
@@ -192,3 +273,31 @@ if __name__ == "__main__":
         print("PASS: <p>-tag handling correctly captures Tesla's DFIN-generated content")
     else:
         print("\n[TSLA <p>-tag regression check] TSLA 10-K sample not present, skipping")
+
+    msft_path = os.path.join(samples_dir, 'MSFT_10-K_2022-06-30.htm')
+    if os.path.exists(msft_path):
+        with open(msft_path, 'r', encoding='utf-8', errors='replace') as f:
+            html_msft = f.read()
+        soup_msft = BeautifulSoup(html_msft, 'lxml')
+        records_msft = build_records(soup_msft)
+        sections_found = sum(1 for r in records_msft if r['section'])
+        # Regression guard for a second real, distinct heading-detection
+        # gap found on this same file: Microsoft's DFIN template applies
+        # bold styling directly on the <p> element itself
+        # (<p style="...font-weight:bold...">TEXT</p>), not via a nested
+        # <span> like Workiva and Tesla's DFIN template both use. A
+        # version that only checked descendant spans found ZERO "Item
+        # N"/"PART" headings on this file despite them clearly being
+        # present -- confirmed before fixing by tracing the real markup
+        # around "ITEM 1. BUSINESS". Fixed by also checking is_bold_span()
+        # on the container element itself, not just its descendant spans.
+        print(f"[MSFT 10-K, DFIN-generated, bold-on-element] {len(records_msft)} blocks, "
+              f"{sections_found}/{len(records_msft)} with a detected section")
+        assert sections_found == len(records_msft), (
+            f"REGRESSION: only {sections_found}/{len(records_msft)} blocks have a detected "
+            f"section on MSFT's DFIN-generated filing -- the bold-on-element-itself heading "
+            f"detection may be broken again."
+        )
+        print("PASS: bold-on-element heading detection correctly captures MSFT's Item/PART headings")
+    else:
+        print("\n[MSFT bold-on-element regression check] MSFT 10-K sample not present, skipping")

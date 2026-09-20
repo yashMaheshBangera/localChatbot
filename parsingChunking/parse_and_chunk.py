@@ -51,6 +51,7 @@ corpus.
 
 import hashlib
 import json
+import re
 from pathlib import Path
 
 import yaml
@@ -71,6 +72,39 @@ from table_cleaner import (
     split_grid_into_column_groups,
     grid_to_text,
 )
+
+_YEAR_PATTERN = re.compile(r"\b(19[5-9]\d|20[0-4]\d)\b")
+
+
+def extract_years_mentioned(text: str) -> list:
+    """Returns every distinct 4-digit year explicitly mentioned in a
+    chunk's own text, sorted ascending -- e.g. "...$648,125 million in
+    fiscal 2024, up from $611,289 million in fiscal 2023..." ->
+    [2023, 2024].
+
+    Built to fix a real, confirmed problem: a chunk's `fiscal_period_end`
+    metadata records only the FILING's own period -- but a single filing
+    routinely reports comparative prior-year figures in the same chunk
+    (MD&A narrative, multi-year tables), and the filing's own period is a
+    weak, indirect signal for which year a specific number in the chunk
+    text actually discusses. Confirmed via generate_batch.py run across
+    the full golden set: the model cited a wrong-period source for
+    fiscal-year questions (e.g. citing a FY2026 filing for a FY2024
+    question) even when the correct-period source was ALSO present in
+    context -- deliberately not fixed by prompt wording alone (rule 7
+    was tried and did not reliably generalize), fixed instead by making
+    the actual years a chunk discusses an explicit, structured field the
+    prompt can state directly, rather than something the model has to
+    infer from a date.
+
+    Deliberately returns every year found, not a single "the" period --
+    a comparative chunk genuinely covers more than one year at once, and
+    collapsing that to one value would lose real information rather than
+    add it. Range restricted to 1950-2049 to avoid matching unrelated
+    4-digit numbers (dollar figures, accession number fragments) that
+    happen to fall outside any plausible filing year."""
+    years = {int(m.group(0)) for m in _YEAR_PATTERN.finditer(text)}
+    return sorted(years)
 
 # This script's own directory -- the starting point for finding config.yaml.
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -275,6 +309,7 @@ def process_filing(tokenizer, splitter, meta: dict, max_tokens: int) -> list:
                     "table_id": table_id,
                     "group_index": group_index,
                     "group_count": group_count,
+                    "years_mentioned": extract_years_mentioned(piece),
                     "text": piece,
                 })
                 idx += 1
@@ -302,6 +337,7 @@ def process_filing(tokenizer, splitter, meta: dict, max_tokens: int) -> list:
                     "section": block["section"],
                     "chunk_type": "text",
                     "token_count": token_count,
+                    "years_mentioned": extract_years_mentioned(piece),
                     "text": piece,
                 })
                 idx += 1
