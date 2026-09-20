@@ -94,7 +94,15 @@ def embed_batch(base_url: str, model: str, texts: list, api_key: str | None = No
         json={"model": model, "input": texts},
         timeout=120,
     )
-    resp.raise_for_status()
+    if not resp.ok:
+        # requests' default HTTPError from raise_for_status() discards the
+        # response body -- which is exactly where vLLM puts the actually
+        # useful diagnostic (e.g. "maximum context length is 512 tokens,
+        # requested 514"). Surface it instead of a bare status code.
+        raise requests.HTTPError(
+            f"{resp.status_code} {resp.reason} for url {resp.url}\n"
+            f"Response body: {resp.text[:2000]}"
+        )
     data = resp.json()["data"]
     # /v1/embeddings responses aren't guaranteed to preserve input order --
     # each item carries its own "index", so sort defensively rather than
@@ -150,27 +158,51 @@ def main():
         if out_path.exists():
             continue  # idempotent: skip already-embedded filings
 
-        # Length-check against the model's max tokens. If a chunk is too
-        # long (tables in particular, since they're kept atomic/unsplit),
-        # the EMBEDDING is computed from a truncated version, but the
-        # record's "text" field keeps the FULL original -- so retrieval
-        # still finds the chunk (via an imperfect but usable vector) while
-        # generation still sees the complete table, not a truncated one.
-        # embedding_truncated makes this explicit rather than silent, so
-        # retrieval/eval code can account for it if needed (e.g. weighting
-        # such matches differently, or flagging them for a future rerun
-        # once a longer-context embedding model is used).
+        # Length-check against the model's max tokens, reserving headroom
+        # for special tokens the SERVER adds during its own preprocessing.
+        #
+        # Root cause of a real failure mode hit on the full corpus: this
+        # check originally used tokenizer.encode(text, truncation=False)
+        # without add_special_tokens=False, inconsistent with
+        # parse_and_chunk.py (which always passes it explicitly). For a
+        # BERT-family tokenizer (bge-large-en-v1.5's), the default silently
+        # adds [CLS]/[SEP] -- 2 extra tokens -- when counting locally. But
+        # the deeper issue wasn't just miscounting: vLLM's server ALSO adds
+        # its own [CLS]/[SEP] when it receives raw text and tokenizes it
+        # server-side, before checking against its hard max-length limit.
+        # Since parse_and_chunk.py already targets exactly 512 content
+        # tokens per chunk (that's the configured chunk_size), most chunks
+        # sit right at that boundary -- so nearly every chunk, once the
+        # server added its own 2 specials, exceeded vLLM's true 512-token
+        # limit and got rejected with 400, regardless of whether THIS
+        # script's own check had flagged it as "oversized" or not. That's
+        # why the full-corpus run produced 0 successfully embedded chunks
+        # despite finishing suspiciously fast (every request failing near-
+        # instantly, not actually running inference).
+        #
+        # Fix: count content tokens only (add_special_tokens=False, matching
+        # parse_and_chunk.py), and enforce a ceiling of max_tokens minus a
+        # safety buffer -- applied to EVERY chunk uniformly, not only ones
+        # already far over budget -- so that even after the server adds its
+        # own specials, nothing exceeds the model's real limit.
+        SPECIAL_TOKEN_BUFFER = 8  # BERT needs 2 ([CLS]+[SEP]); a few extra
+                                  # tokens of margin against any further
+                                  # tokenizer/preprocessing discrepancies
+        effective_max_tokens = max_tokens - SPECIAL_TOKEN_BUFFER
+
         texts = []
         truncated_flags = []
         for r in records:
-            token_ids = tokenizer.encode(r["text"], truncation=False)
-            if len(token_ids) > max_tokens:
+            token_ids = tokenizer.encode(r["text"], truncation=False, add_special_tokens=False)
+            if len(token_ids) > effective_max_tokens:
                 tqdm.write(
                     f"  [warn] {rel} chunk {r['chunk_id']} ({r['chunk_type']}) "
-                    f"is {len(token_ids)} tokens, truncating to {max_tokens} "
-                    f"for embedding (full text kept in the record)"
+                    f"is {len(token_ids)} content tokens, truncating to "
+                    f"{effective_max_tokens} (reserves {SPECIAL_TOKEN_BUFFER} "
+                    f"for special tokens the server adds) for embedding "
+                    f"(full text kept in the record)"
                 )
-                token_ids = token_ids[:max_tokens]
+                token_ids = token_ids[:effective_max_tokens]
                 texts.append(tokenizer.decode(token_ids, skip_special_tokens=True))
                 truncated_flags.append(True)
                 total_truncated += 1
