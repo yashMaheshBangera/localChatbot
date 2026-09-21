@@ -37,7 +37,8 @@ reasoning and the context-loss problem this solves.
 import argparse
 import json
 from pathlib import Path
-
+from langsmith import traceable
+from langsmith.run_helpers import get_current_run_tree
 import requests
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -65,7 +66,7 @@ def load_config() -> tuple:
         config = yaml.safe_load(f)
     return config, config_path.parent
 
-
+@traceable(name="embedding", run_type="embedding")
 def embed_query(base_url: str, model: str, query: str, api_key=None) -> list:
     """Embeds a single query string via vLLM's /v1/embeddings endpoint.
     Same raw-HTTP approach as embed_chunks.py's embed_batch() -- see
@@ -85,8 +86,16 @@ def embed_query(base_url: str, model: str, query: str, api_key=None) -> list:
             f"{resp.status_code} {resp.reason} for url {resp.url}\n"
             f"Response body: {resp.text[:2000]}"
         )
-    data = resp.json()["data"]
-    return data[0]["embedding"]
+    data = resp.json()
+    usage = data.get("usage", {})
+    run = get_current_run_tree()
+    if run is not None:
+        run.metadata.update({
+            "model": model,
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "total_tokens": usage.get("total_tokens"),
+        })
+    return data["data"][0]["embedding"]
 
 
 def build_filter(ticker=None, tickers=None, form_type=None, chunk_type=None,
@@ -202,7 +211,7 @@ def _truncate_document_for_reranker(tokenizer, query_text: str, document_text: s
     truncated_ids = doc_token_ids[:max(budget_for_document, 0)]
     return tokenizer.decode(truncated_ids, skip_special_tokens=True)
 
-
+@traceable(name="rerank", run_type="tool")
 def rerank(base_url: str, model: str, query_text: str, hits: list, api_key=None):
     """Re-scores a list of dense-search hits using a cross-encoder
     reranker (e.g. BAAI/bge-reranker-base) served via vLLM's

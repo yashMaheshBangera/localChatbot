@@ -75,6 +75,27 @@ from table_cleaner import (
 
 _YEAR_PATTERN = re.compile(r"\b(19[5-9]\d|20[0-4]\d)\b")
 
+def build_table_preamble(meta: dict, section: str) -> str:
+    """Short natural-language framing prepended to a table chunk's text
+    before it's embedded (and, since `text` is also what generation shows
+    the LLM, before it's shown there too). Confirmed, real problem this
+    fixes: a bare pipe-delimited numbers table (e.g. a gross-margin-
+    percentage table with no sentence anywhere saying what it is or what
+    year it covers) has far less semantic surface for an embedding model
+    to match against a prose question than a text chunk stating the same
+    fact in a full sentence -- verified by grepping the real corpus for a
+    known figure (46.2%), finding it correctly chunked and correctly
+    period-tagged, and confirming it simply never retrieved for a directly
+    matching query ("Apple's total gross margin percentage in 2024").
+    States the ticker, filing type, fiscal period, and section -- exactly
+    the words a natural question about this table is likely to use --
+    giving the embedding vector real anchor text, not a parsing fix (the
+    fact was always captured correctly) but a retrievability one."""
+    period = (meta.get("fiscal_period_end") or "")[:10]
+    return (
+        f"The following table is from {meta['ticker']}'s {meta['form_type']} "
+        f"(fiscal period ending {period}), section \"{section}\":\n"
+    )
 
 def extract_years_mentioned(text: str) -> list:
     """Returns every distinct 4-digit year explicitly mentioned in a
@@ -208,44 +229,30 @@ def process_filing(tokenizer, splitter, meta: dict, max_tokens: int) -> list:
             # code never needs to special-case "was this table split".
             table_id = chunk_id_for(meta["local_path"], f"table-{table_block_idx}")
             table_block_idx += 1
+            table_preamble = build_table_preamble(meta, block["section"])
+            preamble_tokens = len(
+                tokenizer.encode(table_preamble, truncation=False, add_special_tokens=False)
+            )
+            # Reserve room for the preamble BEFORE deciding how to split --
+            # otherwise a piece sized right up against max_tokens would
+            # exceed it once the preamble is prepended, and
+            # check_token_limits.py would start flagging otherwise-correct
+            # chunks. All split-sizing decisions below use this reduced
+            # budget, not the raw max_tokens.
+            effective_max_tokens = max_tokens - preamble_tokens
 
             table_token_count = len(
                 tokenizer.encode(block["content"], truncation=False, add_special_tokens=False)
             )
 
-            if table_token_count <= max_tokens:
-                # Fits within budget -- stays one atomic chunk, as before.
+            if table_token_count <= effective_max_tokens:
                 table_pieces = [block["content"]]
             else:
-                # Oversized: split rather than truncate. See module
-                # docstring for why this replaced embedding-time truncation.
                 grid = block["grid"]
 
                 def count_tokens(text):
                     return len(tokenizer.encode(text, truncation=False, add_special_tokens=False))
 
-                # Two genuinely different oversized-table shapes, found
-                # from real examples, not anticipated in advance:
-                #   1. Many ROWS (e.g. a 32-row income statement) -- fixed
-                #      by split_grid_into_row_groups, splitting between
-                #      rows and repeating header rows in every group.
-                #   2. Many COLUMNS (e.g. JPMorgan's "Markets revenue"
-                #      table: Fixed Income/Equity/Total Markets x 3 years
-                #      side by side, 22 columns) -- row-splitting can't
-                #      help here, since EVERY row is oversized regardless
-                #      of how few are packed together; the problem is
-                #      column count, not row count. Detected via bare year
-                #      labels ("2025", "2024", "2023") as anchors between
-                #      repeating column groups -- verified against two
-                #      independent real tables (JPMorgan's and, as a
-                #      generalization check, Apple's differently-shaped
-                #      "Products and Services Performance" table), both
-                #      producing correctly-labeled, data-complete
-                #      sub-tables (automated multiset check, not eyeballed).
-                # Column-splitting runs FIRST when detected, since a table
-                # can be both wide AND tall -- each resulting narrower
-                # piece still goes through row-splitting afterward if IT
-                # alone is still oversized.
                 column_groups = detect_period_column_groups(grid)
                 if column_groups:
                     column_split_grids = split_grid_into_column_groups(grid, column_groups)
@@ -255,43 +262,30 @@ def process_filing(tokenizer, splitter, meta: dict, max_tokens: int) -> list:
                 table_pieces = []
                 for sub_grid in column_split_grids:
                     sub_token_count = count_tokens(grid_to_text(sub_grid))
-                    if sub_token_count <= max_tokens:
+                    if sub_token_count <= effective_max_tokens:
                         table_pieces.append(grid_to_text(sub_grid))
                     else:
                         header_row_count = detect_header_row_count(sub_grid)
                         row_groups = split_grid_into_row_groups(
-                            sub_grid, header_row_count, count_tokens, max_tokens
+                            sub_grid, header_row_count, count_tokens, effective_max_tokens
                         )
                         table_pieces.extend(grid_to_text(g) for g in row_groups)
 
-                table_pieces = [p for p in table_pieces if p.strip()]  # drop any empty group
+                table_pieces = [p for p in table_pieces if p.strip()]
 
             group_count = len(table_pieces)
             for group_index, piece in enumerate(table_pieces):
+                full_text = table_preamble + piece
                 token_count = len(
-                    tokenizer.encode(piece, truncation=False, add_special_tokens=False)
+                    tokenizer.encode(full_text, truncation=False, add_special_tokens=False)
                 )
-                # This should be rare-to-nonexistent for genuine financial
-                # tables (verified: largest single row across a full 10-K,
-                # 604 rows checked, was ~183 words -- from a narrative audit
-                # discussion, not a numeric table -- comfortably under
-                # budget). But it's only verified against ONE filer; other
-                # tickers/industries (e.g. a bank's collateral schedules)
-                # could plausibly differ. Flagged LOUDLY rather than left to
-                # embed_chunks.py's silent truncation fallback, so if this
-                # ever actually fires, it's immediately visible and can be
-                # fixed properly (grounded in a real example) rather than
-                # speculatively engineered for now.
                 row_too_large = token_count > max_tokens
                 if row_too_large:
                     tqdm.write(
                         f"  [ROW TOO LARGE] {meta['ticker']} {meta['form_type']} "
                         f"{meta['fiscal_period_end']}, section={block['section']!r}: "
-                        f"a single table row (plus header) is {token_count} tokens, "
-                        f"exceeding max_tokens={max_tokens} even before any embedding-"
-                        f"time truncation. This is the rare edge case noted in the "
-                        f"README -- if you see this, it's worth pasting the row content "
-                        f"back for a proper fix rather than relying on truncation."
+                        f"a single table row (plus header, plus preamble) is "
+                        f"{token_count} tokens, exceeding max_tokens={max_tokens}."
                     )
                 records.append({
                     "chunk_id": chunk_id_for(meta["local_path"], idx),
@@ -310,7 +304,7 @@ def process_filing(tokenizer, splitter, meta: dict, max_tokens: int) -> list:
                     "group_index": group_index,
                     "group_count": group_count,
                     "years_mentioned": extract_years_mentioned(piece),
-                    "text": piece,
+                    "text": full_text,
                 })
                 idx += 1
         else:  # text block -- may need splitting

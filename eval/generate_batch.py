@@ -24,6 +24,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from langsmith import traceable
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -64,7 +65,7 @@ def load_golden_questions(path: Path) -> list:
     with open(path) as f:
         return json.load(f)
 
-
+@traceable(name="rag_eval_question", run_type="chain")
 def run_one(config, retrieve_module, generate_module, question: dict,
             limit: int, use_rerank: bool, rerank_candidates: int) -> dict:
     """Runs the real generate.py pipeline for a single question -- same

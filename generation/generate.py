@@ -59,6 +59,8 @@ import argparse
 import re
 import sys
 from pathlib import Path
+from langsmith import traceable
+from langsmith.run_helpers import get_current_run_tree
 
 import requests
 
@@ -220,6 +222,8 @@ def build_messages(query: str, context_blocks: list) -> list:
     ]
 
 
+
+@traceable(name="generation", run_type="llm")
 def generate_answer(base_url: str, model: str, messages: list, api_key=None,
                      temperature: float = 0.0, max_tokens: int = 400) -> str:
     """Calls the generation LLM's OpenAI-compatible /v1/chat/completions
@@ -260,7 +264,17 @@ def generate_answer(base_url: str, model: str, messages: list, api_key=None,
             f"{resp.status_code} {resp.reason} for url {resp.url}\n"
             f"Response body: {resp.text[:2000]}"
         )
-    return resp.json()["choices"][0]["message"]["content"]
+    data = resp.json()
+    usage = data.get("usage", {})
+    run = get_current_run_tree()
+    if run is not None:
+        run.metadata.update({
+            "model": model,
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "completion_tokens": usage.get("completion_tokens"),
+            "total_tokens": usage.get("total_tokens"),
+        })
+    return data["choices"][0]["message"]["content"]
 
 
 def format_sources(results: list) -> str:
@@ -274,6 +288,60 @@ def format_sources(results: list) -> str:
         )
     return "\n".join(lines)
 
+@traceable(name="rag_query", run_type="chain")
+def run_query(args,config,retrieve_module):
+    query_vector = retrieve_module.embed_query(
+        config.get("vllm_base_url", "http://localhost:8000"),
+        config["embedding_model_id"],
+        args.query,
+        config.get("vllm_api_key"),
+        )
+    
+    from qdrant_client import QdrantClient
+    client = QdrantClient(
+        url=config.get("qdrant_url", "http://localhost:6333"),
+        api_key=config.get("qdrant_api_key"),
+        )
+    collection_name = config.get("collection_name", "sec_filings")
+    
+    tickers = args.ticker if args.ticker and len(args.ticker) > 1 else None
+    ticker = args.ticker[0] if args.ticker and len(args.ticker) == 1 else None
+    query_filter = retrieve_module.build_filter(
+        ticker=ticker, tickers=tickers, form_type=args.form_type, chunk_type=args.chunk_type,
+        fiscal_period_start=args.fiscal_period_start, fiscal_period_end=args.fiscal_period_end,
+    )
+    
+    if args.rerank:
+        hits = retrieve_module.search(client, collection_name, query_vector,
+                               query_filter, args.rerank_candidates)
+        hits = retrieve_module.rerank(
+            config.get("reranker_base_url", "http://localhost:8001"),
+            config.get("reranker_model_id", "BAAI/bge-reranker-base"),
+            args.query, hits, config.get("reranker_api_key"),
+        )
+    else:
+        hits = retrieve_module.search(client, collection_name, query_vector,
+                                           query_filter, args.limit)
+    
+    results = retrieve_module.reconstruct_results(client, collection_name, hits)
+    results = results[:args.limit]
+    
+    target_years = extract_target_years(args.query)
+    results = filter_matching_period(results, target_years)
+    
+    if not results:
+        print("No relevant context found for this query -- nothing to answer from.")
+        return None, []
+    
+    context_blocks = build_context_blocks(results)
+    messages = build_messages(args.query, context_blocks)
+    answer = generate_answer(
+        config.get("generation_base_url", "http://localhost:8002"),
+        config.get("generation_model_id", "microsoft/Phi-4-mini-instruct"),
+            messages,
+            config.get("generation_api_key"),
+        )
+    return answer, results
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -294,58 +362,10 @@ def main():
 
     config, retrieve_module = load_config_and_retrieve_module()
 
-    query_vector = retrieve_module.embed_query(
-        config.get("vllm_base_url", "http://localhost:8000"),
-        config["embedding_model_id"],
-        args.query,
-        config.get("vllm_api_key"),
-    )
-
-    from qdrant_client import QdrantClient
-    client = QdrantClient(
-        url=config.get("qdrant_url", "http://localhost:6333"),
-        api_key=config.get("qdrant_api_key"),
-    )
-    collection_name = config.get("collection_name", "sec_filings")
-
-    tickers = args.ticker if args.ticker and len(args.ticker) > 1 else None
-    ticker = args.ticker[0] if args.ticker and len(args.ticker) == 1 else None
-    query_filter = retrieve_module.build_filter(
-        ticker=ticker, tickers=tickers, form_type=args.form_type, chunk_type=args.chunk_type,
-        fiscal_period_start=args.fiscal_period_start, fiscal_period_end=args.fiscal_period_end,
-    )
-
-    if args.rerank:
-        hits = retrieve_module.search(client, collection_name, query_vector,
-                                       query_filter, args.rerank_candidates)
-        hits = retrieve_module.rerank(
-            config.get("reranker_base_url", "http://localhost:8001"),
-            config.get("reranker_model_id", "BAAI/bge-reranker-base"),
-            args.query, hits, config.get("reranker_api_key"),
-        )
-    else:
-        hits = retrieve_module.search(client, collection_name, query_vector,
-                                       query_filter, args.limit)
-
-    results = retrieve_module.reconstruct_results(client, collection_name, hits)
-    results = results[:args.limit]
-
-    target_years = extract_target_years(args.query)
-    results = filter_matching_period(results, target_years)
-
-    if not results:
-        print("No relevant context found for this query -- nothing to answer from.")
+    answer, results = run_query(args, config, retrieve_module)
+    if answer is None:
         return
-
-    context_blocks = build_context_blocks(results)
-    messages = build_messages(args.query, context_blocks)
-    answer = generate_answer(
-        config.get("generation_base_url", "http://localhost:8002"),
-        config.get("generation_model_id", "microsoft/Phi-4-mini-instruct"),
-        messages,
-        config.get("generation_api_key"),
-    )
-
+    
     print(f"Question: {args.query}\n")
     print(f"Answer:\n{answer}\n")
     print(f"Sources:\n{format_sources(results)}")

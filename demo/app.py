@@ -20,6 +20,7 @@ import sys
 from pathlib import Path
 
 import streamlit as st
+from langsmith import traceable
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -57,6 +58,7 @@ def load_modules():
     return config, retrieve_module, generate_module
 
 
+@traceable(name="rag_demo_query", run_type="chain")
 def answer_question(query: str, ticker, form_type, limit: int,
                      use_rerank: bool, rerank_candidates: int = 50):
     """Runs the real generate.py pipeline for one question -- same
@@ -142,7 +144,10 @@ query = st.text_input(
 if st.button("Ask", type="primary") and query:
     with st.spinner("Retrieving context and generating answer..."):
         try:
-            answer, results = answer_question(query, ticker, form_type, limit, use_rerank)
+            answer, results = answer_question(
+                query=query, ticker=ticker, form_type=form_type,
+                limit=limit, use_rerank=use_rerank,
+            )
         except Exception as e:
             st.error(
                 "Something went wrong — is the full pipeline running? "
@@ -155,7 +160,7 @@ if st.button("Ask", type="primary") and query:
         st.warning("No relevant context found for this query.")
     else:
         st.subheader("Answer")
-        st.text(answer)
+        st.write(answer)
 
         st.subheader("Sources")
         for i, r in enumerate(results, 1):
